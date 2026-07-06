@@ -1,0 +1,19 @@
+{
+  "name": "humanhunt",
+  "version": "1.0.0",
+  "description": "인간을 찾아라 - 역방향 튜링 테스트 파티게임",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
