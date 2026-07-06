@@ -134,6 +134,11 @@
         <div class="label" style="margin-bottom:10px">그들의 눈에 비친 나</div>
         <div id="aboutMe"></div>
       </div>
+      <div id="modelBoardPanel" class="panel hidden" style="margin-bottom:14px;padding:18px">
+        <div class="label" style="margin-bottom:10px">인간 위장 랭킹 · 발각률 낮을수록 고수</div>
+        <div id="modelBoard"></div>
+        <div style="font-size:11px;color:var(--faint);margin-top:8px">서버가 켜진 이후의 누적 기록입니다</div>
+      </div>
       <button class="primary" onclick="location.reload()">새 방으로</button>
     </div>
   </div>
@@ -242,7 +247,8 @@ socket.on('state', (snap) => {
     if (p.nick === S.myNick && S.phase !== 'result') suffix = ' <span style="color:var(--human)">·나</span>';
     if (S.phase === 'result' && S.result) {
       const role = S.result.roles[p.nick];
-      suffix = ` <span style="color:${role==='AI'?'var(--ai)':'var(--human)'}">·${role==='AI'?'AI':'인간'}</span>`;
+      const model = S.result.models && S.result.models[p.nick];
+      suffix = ` <span style="color:${role==='AI'?'var(--ai)':'var(--human)'}">·${role==='AI'?(model||'AI'):'인간'}</span>`;
     }
     return `<span class="chip" style="color:${p.color};border-color:${p.nick===S.myNick && S.phase!=='result' ? 'var(--human)' : 'var(--line)'}">${esc(p.nick)}${suffix}</span>`;
   }).join('');
@@ -312,7 +318,7 @@ function renderResult(){
     <div class="dash" style="display:flex;align-items:baseline;gap:10px;padding:8px 0">
       <span style="font-family:var(--mono);font-size:13px;color:var(--faint);min-width:18px">${i+1}</span>
       <span style="font-family:var(--mono);font-size:14px;color:${s.color};min-width:64px">${esc(s.nick)}${s.nick===S.myNick?' ·나':''}</span>
-      <span style="font-family:var(--mono);font-size:12px;min-width:34px;color:${R.roles[s.nick]==='AI'?'var(--ai)':'var(--human)'}">${R.roles[s.nick]==='AI'?'AI':'인간'}</span>
+      <span style="font-family:var(--mono);font-size:12px;min-width:34px;color:${R.roles[s.nick]==='AI'?'var(--ai)':'var(--human)'}">${R.roles[s.nick]==='AI'?esc(R.models && R.models[s.nick] || 'AI'):'인간'}</span>
       <span style="font-size:13px;color:var(--ai)">추리 ${s.detect}/${s.detectMax}</span>
       <span style="font-size:13px;color:var(--human)">은신 ${s.misled}/${s.misledMax}</span>
       <span style="font-family:var(--mono);font-size:14px;font-weight:700;margin-left:auto">${s.detect+s.misled}</span>
@@ -326,6 +332,19 @@ function renderResult(){
       ${rs && rs.top === S.myNick ? `<span style="font-size:13px;color:var(--sub)">"${esc(rs.reason)}"</span>` : ''}
     </div>`;
   }).join('');
+
+  /* 모델별 발각률 리더보드 */
+  const hasBoard = R.modelBoard && R.modelBoard.length > 0 && !(R.modelBoard.length === 1 && R.modelBoard[0].label === '연습봇');
+  $('modelBoardPanel').classList.toggle('hidden', !hasBoard);
+  if (hasBoard) {
+    $('modelBoard').innerHTML = R.modelBoard.map((m, i) => `
+      <div class="dash" style="display:flex;align-items:baseline;gap:10px;padding:7px 0">
+        <span style="font-family:var(--mono);font-size:13px;color:var(--faint);min-width:18px">${i+1}</span>
+        <span style="font-family:var(--mono);font-size:14px;color:var(--ai)">${esc(m.label)}</span>
+        <span style="font-size:13px;color:var(--sub)">출전 ${m.seats}회</span>
+        <span style="font-family:var(--mono);font-size:14px;font-weight:700;margin-left:auto;color:${m.detectRate<=40?'var(--ok)':m.detectRate<=70?'var(--human)':'var(--danger)'}">발각률 ${m.detectRate}%</span>
+      </div>`).join('');
+  }
 
   /* 통산 기록 1회 반영 */
   const st = stats();
