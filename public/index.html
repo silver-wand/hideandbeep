@@ -72,6 +72,10 @@
       질문 3개 후 전원이 전원을 태깅. <span style="color:var(--ai)">맞추면 추리 점수</span>, <span style="color:var(--human)">속이면 은신 점수.</span>
     </p>
     <input id="inpName" type="text" maxlength="12" placeholder="내 이름 (로비에서만 보임)" style="margin-bottom:12px"/>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button id="diffEasy" onclick="setDiff('easy')" style="flex:1;font-family:var(--mono);font-size:13px;padding:10px">🌱 순한맛<br/><span style="font-size:11px;color:var(--sub);font-weight:400">AI가 허당임. 입문용</span></button>
+      <button id="diffHard" onclick="setDiff('hard')" style="flex:1;font-family:var(--mono);font-size:13px;padding:10px">🔥 매운맛<br/><span style="font-size:11px;color:var(--sub);font-weight:400">상위 모델. 안 들킴</span></button>
+    </div>
     <button class="primary" style="width:100%;margin-bottom:14px" onclick="createRoom()">방 만들기</button>
     <div class="row">
       <input id="inpCode" type="text" maxlength="4" placeholder="방 코드 4자리"
@@ -80,6 +84,7 @@
     </div>
     <div id="homeErr" class="err" style="margin-top:10px"></div>
     <div id="homeStats" style="font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px"></div>
+    <a href="/stats.html" style="display:inline-block;margin-top:12px;font-size:13px;color:var(--human);text-decoration:none">📊 서버 전적 보기 →</a>
   </div>
 
   <!-- 로비 -->
@@ -165,11 +170,22 @@ const renderStats = () => {
   $('homeStats').textContent = st.games ? `통산 ${st.games}판 · 추리 ${st.dh}/${st.dt} · 은신 ${st.mh}/${st.mt}` : '';
 };
 renderStats();
+setDiff('easy');
 
 /* ── 접속 액션 ── */
+let myDiff = 'easy';
+function setDiff(d){
+  myDiff = d;
+  const on = (el, act) => {
+    el.style.borderColor = act ? (d==='hard' && act ? 'var(--danger)' : 'var(--human)') : 'var(--line)';
+    el.style.color = act ? 'var(--text)' : 'var(--sub)';
+  };
+  on(document.getElementById('diffEasy'), d==='easy');
+  on(document.getElementById('diffHard'), d==='hard');
+}
 function createRoom() {
   const name = $('inpName').value.trim() || '익명';
-  socket.emit('create_room', name, (r) => {
+  socket.emit('create_room', { name, difficulty: myDiff }, (r) => {
     if (!r.ok) return $('homeErr').textContent = r.error || '방 생성 실패';
     setSess({ code: r.code, token: r.token, name });
   });
@@ -188,7 +204,12 @@ socket.on('connect', () => {
   const s = sess();
   if (s && s.code && s.token) socket.emit('join_room', { code: s.code, token: s.token, name: s.name }, () => {});
 });
-function startGame(){ socket.emit('start_game'); }
+function startGame(){
+  if (!S || !S.lobby) return;
+  const h = S.lobby.count, a = 6 - h;
+  if (!confirm(`지금 인간 ${h}명 + AI ${a}명으로 시작할까요?\n친구를 더 기다릴 거면 '취소'를 누르세요.`)) return;
+  socket.emit('start_game');
+}
 function submitAnswer(){
   const t = $('inpAnswer').value.trim();
   if (!t) return;
@@ -235,8 +256,9 @@ socket.on('state', (snap) => {
         border:1px solid ${i < S.lobby.count ? 'var(--human)' : 'var(--line)'};
         background:${i < S.lobby.count ? 'rgba(255,201,77,.1)' : 'transparent'};
         color:${i < S.lobby.count ? 'var(--human)' : 'var(--faint)'}">${i < S.lobby.count ? '인간' : '?'}</div>`).join('');
-    $('lobbyNames').textContent = `접속: ${S.lobby.names.map(esc).join(', ')} · 시작하면 빈자리는 조용히 채워집니다`;
+    $('lobbyNames').textContent = `접속: ${S.lobby.names.map(esc).join(', ')} · ${S.difficulty === 'hard' ? '🔥 매운맛' : '🌱 순한맛'} · 시작하면 빈자리는 조용히 채워집니다`;
     $('btnStart').classList.toggle('hidden', !S.isHost);
+    $('btnStart').textContent = `게임 시작 — 인간 ${S.lobby.count} + AI ${6 - S.lobby.count}`;
     $('lobbyWait').classList.toggle('hidden', S.isHost);
     return;
   }
