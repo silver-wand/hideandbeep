@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>서버 전적 — 인간을 찾아라</title>
+<style>
+  :root {
+    --bg:#12141D; --panel:#1B1E2B; --line:#2C3044; --text:#EAECF4; --sub:#9AA0B8;
+    --faint:#6A7089; --human:#FFC94D; --ai:#7FB4FF; --ok:#7DE2A8; --danger:#FF6B7A;
+    --mono: ui-monospace,"SF Mono",Menlo,monospace;
+    --sans: -apple-system,"Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; color:var(--text); font-family:var(--sans);
+    background: radial-gradient(1000px 500px at 50% -10%, #1C2033 0%, var(--bg) 55%);
+    display:flex; justify-content:center; padding:24px 14px 48px; }
+  .wrap { width:100%; max-width:560px; }
+  .label { font-family:var(--mono); font-size:11px; letter-spacing:.14em; color:var(--faint); text-transform:uppercase; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:18px; margin-bottom:14px; }
+  .row { display:flex; align-items:baseline; gap:10px; padding:7px 0; border-bottom:1px dashed var(--line); }
+  a { color:var(--human); text-decoration:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:18px">
+    <div>
+      <div class="label">SERVER RECORDS</div>
+      <div style="font-size:26px;font-weight:800">서버 <span style="color:var(--human)">전적</span></div>
+    </div>
+    <div style="text-align:right">
+      <div class="label">통산</div>
+      <div id="total" style="font-family:var(--mono);font-size:22px;color:var(--human)">—</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="label" style="margin-bottom:10px">인간 위장 랭킹 (AI) · 발각률 낮을수록 고수</div>
+    <div id="models" style="font-size:14px;color:var(--sub)">불러오는 중...</div>
+  </div>
+
+  <div class="panel">
+    <div class="label" style="margin-bottom:10px">인간 랭킹 · 추리 + 은신 (같은 이름은 같은 사람으로 집계)</div>
+    <div id="humans" style="font-size:14px;color:var(--sub)">불러오는 중...</div>
+  </div>
+
+  <div class="panel">
+    <div class="label" style="margin-bottom:10px">최근 판</div>
+    <div id="recent" style="font-size:14px;color:var(--sub)">불러오는 중...</div>
+  </div>
+
+  <a href="/">← 게임으로 돌아가기</a>
+</div>
+<script>
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const ago = (t) => {
+  const m = Math.floor((Date.now() - t) / 60000);
+  if (m < 1) return '방금'; if (m < 60) return m + '분 전';
+  const h = Math.floor(m / 60); if (h < 24) return h + '시간 전';
+  return Math.floor(h / 24) + '일 전';
+};
+fetch('/api/stats').then(r => r.json()).then(d => {
+  document.getElementById('total').textContent = d.totalGames + '판';
+  document.getElementById('models').innerHTML = d.modelBoard.length ? d.modelBoard.map((m, i) => `
+    <div class="row">
+      <span style="font-family:var(--mono);font-size:13px;color:var(--faint);min-width:18px">${i+1}</span>
+      <span style="font-family:var(--mono);color:var(--ai)">${esc(m.label)}</span>
+      <span style="font-size:13px">출전 ${m.seats}회</span>
+      <span style="font-family:var(--mono);font-weight:700;margin-left:auto;color:${m.detectRate<=40?'var(--ok)':m.detectRate<=70?'var(--human)':'var(--danger)'}">발각률 ${m.detectRate}%</span>
+    </div>`).join('') : '아직 기록 없음';
+  document.getElementById('humans').innerHTML = d.humans.length ? d.humans.map((h, i) => `
+    <div class="row">
+      <span style="font-family:var(--mono);font-size:13px;color:var(--faint);min-width:18px">${i+1}</span>
+      <span style="color:var(--human)">${esc(h.name)}</span>
+      <span style="font-size:13px">${h.games}판</span>
+      <span style="font-size:13px;color:var(--ai);margin-left:auto">추리 ${h.detectPct}%</span>
+      <span style="font-size:13px;color:var(--human)">은신 ${h.stealthPct}%</span>
+    </div>`).join('') : '아직 기록 없음 (로비에서 이름을 입력하고 플레이하면 집계됩니다)';
+  document.getElementById('recent').innerHTML = d.recent.length ? d.recent.map(g => `
+    <div class="row">
+      <span style="font-family:var(--mono);font-size:12px;color:var(--faint);min-width:56px">${ago(g.t)}</span>
+      <span style="font-size:13px">인간 ${g.humans}명</span>
+      <span style="font-size:13px;margin-left:auto;color:var(--sub)">1등: <b style="color:${g.top.role==='AI'?'var(--ai)':'var(--human)'}">${esc(g.top.role==='AI'?(g.top.model||'AI'):(g.top.name||'인간'))}</b> (${g.top.detect+g.top.misled}점)</span>
+    </div>`).join('') : '아직 기록 없음';
+}).catch(() => {
+  document.getElementById('models').textContent = '불러오기 실패 — 새로고침 해보세요';
+});
+</script>
+</body>
+</html>
