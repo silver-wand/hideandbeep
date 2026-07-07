@@ -154,6 +154,7 @@
 const socket = io();
 let S = null;            // 서버 스냅샷
 let myTags = {};
+let myDiff = 'easy';     // 선택된 난이도
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -173,7 +174,6 @@ renderStats();
 setDiff('easy');
 
 /* ── 접속 액션 ── */
-let myDiff = 'easy';
 function setDiff(d){
   myDiff = d;
   const on = (el, act) => {
