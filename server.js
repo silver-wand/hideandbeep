@@ -498,7 +498,11 @@ async function genAiAnswers(room, roundIdx) {
     const tellRule =
       room.difficulty === "hard"
         ? "각자의 \"버릇\"은 3라운드를 통틀어 최대 한 번, 아주 미묘하게만 새어나올 것. 그 외에는 완벽하게 인간처럼."
-        : "각자의 \"버릇\"은 3라운드 중 한두 번만 미묘하게 새어나올 것.";
+        : "각자의 \"버릇\"이 매 라운드 조금씩 티가 나야 함. 눈치 빠른 사람이면 알아챌 수 있을 정도로.";
+    const styleRule =
+      room.difficulty === "hard"
+        ? `진짜 인간처럼 짧게(5~25자), 오타·ㅋㅋ·줄임말 사용, 성의없게, 가끔 딴소리. ${tellRule} 절대 AI 티 내지 말 것.`
+        : `진짜 인간처럼 짧게(5~25자). 일부러 오타, ㅋㅋ, ㅇㅇ, 줄임말, 성의없는 답. 가끔 질문 되묻기, 뜬금없는 딴소리, 노잼 드립도 환영 — 캐릭터를 과감하게, 웃기게 연기할 것. ${tellRule}`;
     const prompt = `너는 익명 채팅 게임의 참가자 "${a.nick}"다. 이 방의 다른 참가자들은 진짜 인간이고, 너는 인간인 척해야 하는 AI다. 게임이 끝나면 서로 누가 AI인지 태깅한다. 들키면 진다.
 
 너의 캐릭터: ${a.persona}
@@ -507,7 +511,7 @@ async function genAiAnswers(room, roundIdx) {
 ${room.rounds.length ? `지금까지의 대화 (진짜 인간들의 답변 포함):\n${historyText(room.rounds)}\n` : ""}
 이번 질문: "${room.questions[roundIdx]}"
 
-지침: 진짜 인간처럼 짧게(5~25자), 오타·ㅋㅋ·줄임말 사용, 성의없게, 가끔 딴소리. 이전 라운드의 "${a.nick}" 말투와 일관성 유지. ${tellRule} 절대 AI 티 내지 말 것.
+지침: ${styleRule} 이전 라운드의 "${a.nick}" 말투와 일관성 유지.
 JSON만 출력: {"text":"답변"}`;
     try {
       const parsed = await callProvider(a.provider, prompt, room.difficulty);
