@@ -29,16 +29,34 @@ const TAG_SEC = FAST ? 5 : 120;
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const CALL_TIMEOUT_MS = 12000;
 
-/* ── AI 모델 공급자 ── */
+/* ── AI 모델 공급자 (순한맛/매운맛 두 티어) ── */
 const PROVIDERS = [];
 if (process.env.ANTHROPIC_API_KEY)
-  PROVIDERS.push({ id: "claude", label: "Claude", model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6" });
+  PROVIDERS.push({
+    id: "claude", label: "Claude",
+    models: {
+      easy: process.env.CLAUDE_MODEL_EASY || "claude-haiku-4-5",
+      hard: process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
+    },
+  });
 if (process.env.OPENAI_API_KEY)
-  PROVIDERS.push({ id: "gpt", label: "ChatGPT", model: process.env.OPENAI_MODEL || "gpt-4o-mini" });
+  PROVIDERS.push({
+    id: "gpt", label: "ChatGPT",
+    models: {
+      easy: process.env.OPENAI_MODEL_EASY || "gpt-4o-mini",
+      hard: process.env.OPENAI_MODEL || "gpt-4o",
+    },
+  });
 if (process.env.GEMINI_API_KEY)
-  PROVIDERS.push({ id: "gemini", label: "Gemini", model: process.env.GEMINI_MODEL || "gemini-2.5-flash" });
+  PROVIDERS.push({
+    id: "gemini", label: "Gemini",
+    models: {
+      easy: process.env.GEMINI_MODEL_EASY || "gemini-2.5-flash",
+      hard: process.env.GEMINI_MODEL || "gemini-2.5-pro",
+    },
+  });
 const STUB_MODE = PROVIDERS.length === 0;
-if (STUB_MODE) PROVIDERS.push({ id: "stub", label: "연습봇", model: "stub" });
+if (STUB_MODE) PROVIDERS.push({ id: "stub", label: "연습봇", models: { easy: "stub", hard: "stub" } });
 
 const withTimeout = (p, ms) =>
   Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
@@ -54,7 +72,8 @@ function safeParse(text) {
   }
 }
 
-async function callProvider(provider, prompt) {
+async function callProvider(provider, prompt, tier = "easy") {
+  const model = provider.models[tier] || provider.models.easy;
   if (provider.id === "stub") throw new Error("stub");
   if (provider.id === "claude") {
     const res = await withTimeout(
@@ -66,7 +85,7 @@ async function callProvider(provider, prompt) {
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify({
-          model: provider.model,
+          model,
           max_tokens: 800,
           messages: [{ role: "user", content: prompt }],
         }),
@@ -88,7 +107,7 @@ async function callProvider(provider, prompt) {
           authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         },
         body: JSON.stringify({
-          model: provider.model,
+          model,
           max_tokens: 800,
           response_format: { type: "json_object" },
           messages: [{ role: "user", content: prompt }],
@@ -101,13 +120,16 @@ async function callProvider(provider, prompt) {
     return safeParse(data.choices[0].message.content);
   }
   if (provider.id === "gemini") {
+    const body = { contents: [{ parts: [{ text: prompt }] }] };
+    /* flash 계열만 생각 기능 끔 (pro는 끄기 미지원) */
+    if (model.includes("flash")) body.generationConfig = { thinkingConfig: { thinkingBudget: 0 } };
     const res = await withTimeout(
       fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${provider.model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
         {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+          body: JSON.stringify(body),
         }
       ),
       CALL_TIMEOUT_MS
@@ -281,15 +303,62 @@ function modelBoard() {
     .sort((a, b) => a.detectRate - b.detectRate);
 }
 
+/* ── 서버 전체 누적 기록 ── */
+const globalStats = { totalGames: 0, recent: [], humans: {} };
+function recordGameHistory(room) {
+  const R = room.result;
+  const nameByNick = {};
+  for (const p of room.players.values()) if (p.nick) nameByNick[p.nick] = p.name;
+  const rows = room.seats.map((s) => ({
+    nick: s.nick,
+    role: R.roles[s.nick],
+    model: R.models[s.nick] || null,
+    name: R.roles[s.nick] === "HUMAN" ? nameByNick[s.nick] || "익명" : null,
+    detect: R.scores[s.nick].detect,
+    misled: R.scores[s.nick].misled,
+  }));
+  globalStats.totalGames++;
+  globalStats.recent.unshift({
+    t: Date.now(),
+    humans: room.players.size,
+    top: [...rows].sort((a, b) => b.detect + b.misled - (a.detect + a.misled))[0],
+    rows,
+  });
+  globalStats.recent = globalStats.recent.slice(0, 50);
+  for (const r of rows) {
+    if (r.role !== "HUMAN") continue;
+    const name = (r.name || "").trim();
+    if (!name || name === "익명") continue;
+    const h = (globalStats.humans[name] = globalStats.humans[name] || { games: 0, d: 0, dm: 0, m: 0, mm: 0 });
+    h.games++;
+    h.d += r.detect; h.dm += R.scores[r.nick].detectMax;
+    h.m += r.misled; h.mm += R.scores[r.nick].misledMax;
+  }
+  redisCmd("SET", "hh:global", JSON.stringify(globalStats));
+}
+
+/* ── 전적 API ── */
+app.get("/api/stats", (req, res) => {
+  const humans = Object.entries(globalStats.humans)
+    .map(([name, h]) => ({
+      name, games: h.games,
+      detectPct: h.dm ? Math.round((h.d / h.dm) * 100) : 0,
+      stealthPct: h.mm ? Math.round((h.m / h.mm) * 100) : 0,
+    }))
+    .sort((a, b) => b.detectPct + b.stealthPct - (a.detectPct + a.stealthPct))
+    .slice(0, 20);
+  res.json({ totalGames: globalStats.totalGames, modelBoard: modelBoard(), humans, recent: globalStats.recent });
+});
+
 /* ── 방 상태 ── */
 const rooms = new Map();
-function makeRoom(hostToken) {
+function makeRoom(hostToken, difficulty = "easy") {
   return {
     code: null, hostToken, phase: "lobby", phaseEndsAt: null,
-    createdAt: Date.now(), lastActive: Date.now(),
+    createdAt: Date.now(), lastActive: Date.now(), difficulty,
     players: new Map(), questions: shuffle(QUESTIONS).slice(0, TOTAL_ROUNDS),
     rounds: [], seats: [], secret: null, answers: {}, tags: {}, result: null,
-    timer: null, advancing: false,
+    timer: null, advancing: false, pendingAi: {}, pendingJudge: null,
   };
 }
 const touch = (room) => (room.lastActive = Date.now());
@@ -328,7 +397,7 @@ async function redisCmd(...args) {
 function serializeRoom(room) {
   return JSON.stringify({
     code: room.code, hostToken: room.hostToken, phase: room.phase, phaseEndsAt: room.phaseEndsAt,
-    createdAt: room.createdAt, lastActive: room.lastActive,
+    createdAt: room.createdAt, lastActive: room.lastActive, difficulty: room.difficulty,
     players: [...room.players.entries()].map(([t, p]) => [t, { nick: p.nick, name: p.name }]),
     questions: room.questions, rounds: room.rounds, seats: room.seats,
     secret: room.secret, answers: room.answers, tags: room.tags, result: room.result,
@@ -379,12 +448,14 @@ async function getRoom(code) {
 (async () => {
   const j = await redisCmd("GET", "hh:modelstats");
   if (j) try { Object.assign(modelStats, JSON.parse(j)); console.log("리더보드 복구됨"); } catch {}
+  const g = await redisCmd("GET", "hh:global");
+  if (g) try { Object.assign(globalStats, JSON.parse(g)); console.log(`전적 복구됨 (통산 ${globalStats.totalGames}판)`); } catch {}
 })();
 
 function snapshotFor(room, token) {
   const p = room.players.get(token);
   return {
-    code: room.code, phase: room.phase, phaseEndsAt: room.phaseEndsAt,
+    code: room.code, phase: room.phase, phaseEndsAt: room.phaseEndsAt, difficulty: room.difficulty,
     isHost: token === room.hostToken, myNick: p ? p.nick : null,
     lobby: { count: room.players.size, names: [...room.players.values()].map((x) => x.name) },
     seats: room.seats, questions: room.phase === "lobby" ? null : room.questions,
@@ -404,6 +475,13 @@ function setPhase(room, phase, seconds) {
   room.phaseEndsAt = seconds ? Date.now() + seconds * 1000 : null;
   clearTimeout(room.timer);
   if (seconds) room.timer = setTimeout(() => advance(room).catch(console.error), seconds * 1000 + 500);
+  /* 인간들이 입력하는 동안 AI 작업을 미리 돌려둔다 (동시 공개라 가능) */
+  if (phase.startsWith("q")) {
+    const r = Number(phase.slice(1));
+    room.pendingAi[r] = genAiAnswers(room, r);
+  } else if (phase === "tag") {
+    room.pendingJudge = genAiJudgments(room);
+  }
   saveRoom(room);
   broadcast(room);
 }
@@ -417,18 +495,22 @@ async function genAiAnswers(room, roundIdx) {
   const jobs = room.secret.aiSeats.map(async (a) => {
     const fallback = { name: a.nick, text: STUB_ANSWERS[Math.floor(Math.random() * STUB_ANSWERS.length)] };
     if (STUB_MODE) return fallback;
+    const tellRule =
+      room.difficulty === "hard"
+        ? "각자의 \"버릇\"은 3라운드를 통틀어 최대 한 번, 아주 미묘하게만 새어나올 것. 그 외에는 완벽하게 인간처럼."
+        : "각자의 \"버릇\"은 3라운드 중 한두 번만 미묘하게 새어나올 것.";
     const prompt = `너는 익명 채팅 게임의 참가자 "${a.nick}"다. 이 방의 다른 참가자들은 진짜 인간이고, 너는 인간인 척해야 하는 AI다. 게임이 끝나면 서로 누가 AI인지 태깅한다. 들키면 진다.
 
 너의 캐릭터: ${a.persona}
-너의 숨길 수 없는 버릇 (3라운드 중 한두 번만 미묘하게 새어나옴): ${a.tell}
+너의 숨길 수 없는 버릇: ${a.tell}
 
 ${room.rounds.length ? `지금까지의 대화 (진짜 인간들의 답변 포함):\n${historyText(room.rounds)}\n` : ""}
 이번 질문: "${room.questions[roundIdx]}"
 
-지침: 진짜 인간처럼 짧게(5~25자), 오타·ㅋㅋ·줄임말 사용, 성의없게, 가끔 딴소리. 이전 라운드의 "${a.nick}" 말투와 일관성 유지. 절대 AI 티 내지 말 것.
+지침: 진짜 인간처럼 짧게(5~25자), 오타·ㅋㅋ·줄임말 사용, 성의없게, 가끔 딴소리. 이전 라운드의 "${a.nick}" 말투와 일관성 유지. ${tellRule} 절대 AI 티 내지 말 것.
 JSON만 출력: {"text":"답변"}`;
     try {
-      const parsed = await callProvider(a.provider, prompt);
+      const parsed = await callProvider(a.provider, prompt, room.difficulty);
       return { name: a.nick, text: String(parsed.text || "").slice(0, 120) || fallback.text };
     } catch (e) {
       console.error(`answer gen failed [${a.providerLabel}]:`, e.message);
@@ -455,7 +537,7 @@ ${historyText(room.rounds)}
 
 JSON만 출력: {"tags":{"닉":"인간 또는 AI"},"top":"닉","reason":"이유"}`;
     try {
-      const parsed = await callProvider(a.provider, prompt);
+      const parsed = await callProvider(a.provider, prompt, room.difficulty);
       const t = {};
       for (const n of others) t[n] = /ai/i.test(String((parsed.tags || {})[n] || "")) ? "AI" : "HUMAN";
       out.tags[a.nick] = t;
@@ -482,7 +564,8 @@ async function advance(room) {
       const humanEntries = [...room.players.entries()].map(([token, p]) => ({
         name: p.nick, text: ans[token] !== undefined ? ans[token] : "…",
       }));
-      const aiEntries = await genAiAnswers(room, r);
+      const aiEntries = await (room.pendingAi[r] || genAiAnswers(room, r));
+      delete room.pendingAi[r];
       room.rounds.push({ question: room.questions[r], entries: shuffle([...humanEntries, ...aiEntries]) });
       if (r + 1 < TOTAL_ROUNDS) setPhase(room, `q${r + 1}`, ANSWER_SEC);
       else setPhase(room, "tag", TAG_SEC);
@@ -491,7 +574,8 @@ async function advance(room) {
     if (room.phase === "tag") {
       const allTags = {};
       for (const [token, p] of room.players) if (room.tags[token]) allTags[p.nick] = room.tags[token];
-      const aiJ = await genAiJudgments(room);
+      const aiJ = await (room.pendingJudge || genAiJudgments(room));
+      room.pendingJudge = null;
       Object.assign(allTags, aiJ.tags);
       const roles = room.secret.roles;
       const scores = {};
@@ -507,6 +591,7 @@ async function advance(room) {
       for (const a of room.secret.aiSeats) models[a.nick] = a.providerLabel;
       room.result = { roles, allTags, reasons: aiJ.reasons, scores, models, modelBoard: null };
       recordModelStats(room);
+      recordGameHistory(room);
       room.result.modelBoard = modelBoard();
       setPhase(room, "result", null);
       return;
@@ -531,11 +616,13 @@ io.on("connection", (socket) => {
   let myToken = null;
   let myCode = null;
 
-  socket.on("create_room", (name, cb) => {
+  socket.on("create_room", (payload, cb) => {
+    const name = typeof payload === "string" ? payload : (payload && payload.name) || "익명";
+    const difficulty = payload && payload.difficulty === "hard" ? "hard" : "easy";
     let code = roomCode();
     while (rooms.has(code)) code = roomCode();
     const token = rid();
-    const room = makeRoom(token);
+    const room = makeRoom(token, difficulty);
     room.code = code;
     room.players.set(token, { nick: null, name: String(name || "익명").slice(0, 12), socketId: socket.id, connected: true });
     rooms.set(code, room);
@@ -584,7 +671,7 @@ io.on("connection", (socket) => {
         persona: personas[i % personas.length],
         tell: tells[i % tells.length],
         provider: provs[i % provs.length],
-        providerLabel: provs[i % provs.length].label,
+        providerLabel: provs[i % provs.length].label + (room.difficulty === "hard" ? "+" : ""),
       })),
       roles: Object.fromEntries(nicks.map((n) => [n, aiNicks.includes(n) ? "AI" : "HUMAN"])),
     };
@@ -640,6 +727,6 @@ server.listen(PORT, () => {
   console.log(`인간을 찾아라 서버 가동: http://localhost:${PORT}`);
   console.log(`질문 풀: ${QUESTIONS.length}개`);
   if (STUB_MODE) console.log("연습 모드: API 키 미설정 (미리 준비된 답변 사용)");
-  else console.log(`AI 참전: ${PROVIDERS.map((p) => `${p.label}(${p.model})`).join(", ")}`);
+  else console.log(`AI 참전: ${PROVIDERS.map((p) => `${p.label}(순한맛 ${p.models.easy} / 매운맛 ${p.models.hard})`).join(", ")}`);
   console.log(REDIS_ON ? "영속화: Redis 연결됨 (방이 재시작에도 유지됩니다)" : "영속화: 꺼짐 (재시작하면 방이 초기화됩니다)");
 });
