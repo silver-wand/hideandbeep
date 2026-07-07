@@ -1,555 +1,371 @@
-/* ─────────────────────────────────────────────
-   인간을 찾아라 — 게임 서버 v2 (3사 AI 대전판)
-   · 질문 100개 랜덤 로테이션
-   · AI 좌석마다 모델 배정: Claude / ChatGPT / Gemini
-   · 결과 화면에서 모델 공개 + 모델별 발각률 리더보드
-   환경변수:
-     ANTHROPIC_API_KEY  (Claude)
-     OPENAI_API_KEY     (ChatGPT)
-     GEMINI_API_KEY     (Gemini)
-   셋 중 있는 것만 참전. 하나도 없으면 연습 모드.
-   모델명 바꾸고 싶으면: CLAUDE_MODEL, OPENAI_MODEL, GEMINI_MODEL
-────────────────────────────────────────────── */
-const express = require("express");
-const http = require("http");
-const path = require("path");
-const crypto = require("crypto");
-const { Server } = require("socket.io");
-
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-app.use(express.static(path.join(__dirname, "public")));
-
-const PORT = process.env.PORT || 3000;
-const FAST = process.env.TEST_FAST === "1";
-const TOTAL_ROUNDS = 3;
-const ANSWER_SEC = FAST ? 5 : 90;
-const TAG_SEC = FAST ? 5 : 120;
-const ROOM_TTL_MS = 30 * 60 * 1000;
-const CALL_TIMEOUT_MS = 20000;
-
-/* ── AI 모델 공급자 ── */
-const PROVIDERS = [];
-if (process.env.ANTHROPIC_API_KEY)
-  PROVIDERS.push({ id: "claude", label: "Claude", model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6" });
-if (process.env.OPENAI_API_KEY)
-  PROVIDERS.push({ id: "gpt", label: "ChatGPT", model: process.env.OPENAI_MODEL || "gpt-4o-mini" });
-if (process.env.GEMINI_API_KEY)
-  PROVIDERS.push({ id: "gemini", label: "Gemini", model: process.env.GEMINI_MODEL || "gemini-2.5-flash" });
-const STUB_MODE = PROVIDERS.length === 0;
-if (STUB_MODE) PROVIDERS.push({ id: "stub", label: "연습봇", model: "stub" });
-
-const withTimeout = (p, ms) =>
-  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
-
-function safeParse(text) {
-  const clean = String(text).replace(/```json|```/g, "").trim();
-  try {
-    return JSON.parse(clean);
-  } catch {
-    const m = clean.match(/\{[\s\S]*\}/);
-    if (m) return JSON.parse(m[0]);
-    throw new Error("JSON 파싱 실패");
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>인간을 찾아라 — 역방향 튜링 테스트</title>
+<style>
+  :root {
+    --bg:#12141D; --panel:#1B1E2B; --panel-up:#232738; --line:#2C3044;
+    --text:#EAECF4; --sub:#9AA0B8; --faint:#6A7089;
+    --human:#FFC94D; --ai:#7FB4FF; --danger:#FF6B7A; --ok:#7DE2A8;
+    --mono: ui-monospace,"SF Mono","Cascadia Code",Menlo,monospace;
+    --sans: -apple-system,"Apple SD Gothic Neo","Pretendard","Malgun Gothic",system-ui,sans-serif;
   }
-}
+  * { box-sizing:border-box; }
+  body {
+    margin:0; min-height:100vh; color:var(--text); font-family:var(--sans);
+    background: radial-gradient(1000px 500px at 50% -10%, #1C2033 0%, var(--bg) 55%);
+    display:flex; justify-content:center; padding:24px 14px 48px;
+  }
+  .wrap { width:100%; max-width:560px; }
+  .label { font-family:var(--mono); font-size:11px; letter-spacing:.14em; color:var(--faint); text-transform:uppercase; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:20px; }
+  button {
+    font-family:var(--sans); font-size:15px; font-weight:700; padding:13px 22px; border-radius:12px;
+    border:1px solid var(--line); background:transparent; color:var(--text); cursor:pointer;
+    transition: transform .12s ease;
+  }
+  button.primary { border:none; background:var(--human); color:#1A1405; }
+  button:disabled { background:var(--panel-up); color:var(--faint); cursor:default; border:none; }
+  button:hover:not(:disabled) { transform: translateY(-1px); }
+  textarea, input[type=text] {
+    width:100%; background:var(--bg); border:1px solid var(--line); border-radius:10px;
+    color:var(--text); font-family:var(--sans); font-size:15px; padding:12px;
+  }
+  textarea { resize:none; }
+  textarea:focus, input:focus, button:focus-visible { outline:2px solid var(--human); outline-offset:2px; }
+  .row { display:flex; align-items:center; gap:12px; }
+  .err { color:var(--danger); font-size:13px; }
+  .chip { font-family:var(--mono); font-size:12px; padding:5px 10px; border-radius:999px; border:1px solid var(--line); background:var(--panel); }
+  .dash { border-bottom:1px dashed var(--line); }
+  @keyframes flipIn { from { opacity:0; transform: rotateX(70deg) translateY(8px);} to { opacity:1; transform:none;} }
+  @keyframes stamp { 0% { opacity:0; transform: scale(1.6);} 60% { transform: scale(.95);} 100% { opacity:1; transform: scale(1);} }
+  @keyframes blink { 0%,100% {opacity:.25} 50% {opacity:1} }
+  .flip { animation: flipIn .3s ease both; }
+  .stamp { animation: stamp .4s ease both; }
+  .blink span { animation: blink 1s infinite; }
+  .blink span:nth-child(2) { animation-delay:.3s; } .blink span:nth-child(3) { animation-delay:.6s; }
+  @media (prefers-reduced-motion: reduce) { * { animation:none !important; transition:none !important; } }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- 헤더 -->
+  <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:18px">
+    <div>
+      <div class="label">REVERSE TURING TEST</div>
+      <div style="font-size:26px;font-weight:800;letter-spacing:-0.02em">인간을 <span style="color:var(--human)">찾아라</span></div>
+    </div>
+    <div style="display:flex;gap:16px;text-align:right">
+      <div><div class="label">추리</div><div id="statDetect" style="font-family:var(--mono);font-size:20px;color:var(--faint)">—</div></div>
+      <div><div class="label">은신</div><div id="statStealth" style="font-family:var(--mono);font-size:20px;color:var(--faint)">—</div></div>
+    </div>
+  </div>
 
-async function callProvider(provider, prompt) {
-  if (provider.id === "stub") throw new Error("stub");
-  if (provider.id === "claude") {
-    const res = await withTimeout(
-      fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": process.env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model: provider.model,
-          max_tokens: 800,
-          messages: [{ role: "user", content: prompt }],
-        }),
-      }),
-      CALL_TIMEOUT_MS
-    );
-    if (!res.ok) throw new Error(`claude ${res.status}`);
-    const data = await res.json();
-    return safeParse(
-      (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n")
-    );
-  }
-  if (provider.id === "gpt") {
-    const res = await withTimeout(
-      fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: provider.model,
-          max_tokens: 800,
-          response_format: { type: "json_object" },
-          messages: [{ role: "user", content: prompt }],
-        }),
-      }),
-      CALL_TIMEOUT_MS
-    );
-    if (!res.ok) throw new Error(`gpt ${res.status}`);
-    const data = await res.json();
-    return safeParse(data.choices[0].message.content);
-  }
-  if (provider.id === "gemini") {
-    const res = await withTimeout(
-      fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${provider.model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-        }
-      ),
-      CALL_TIMEOUT_MS
-    );
-    if (!res.ok) throw new Error(`gemini ${res.status}`);
-    const data = await res.json();
-    return safeParse(
-      (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("\n")
-    );
-  }
-  throw new Error("unknown provider");
-}
+  <!-- 홈 -->
+  <div id="scrHome" class="panel">
+    <p style="font-size:15px;line-height:1.7;color:var(--sub);margin:0 0 18px">
+      6인석 익명 채팅방. 친구들이 들어오고, <b style="color:var(--ai)">빈자리는 AI가 채운다.</b><br/>
+      AI가 몇 명인지는 비밀 — <b style="color:var(--text)">0명일 수도 있다.</b><br/>
+      질문 3개 후 전원이 전원을 태깅. <span style="color:var(--ai)">맞추면 추리 점수</span>, <span style="color:var(--human)">속이면 은신 점수.</span>
+    </p>
+    <input id="inpName" type="text" maxlength="12" placeholder="내 이름 (로비에서만 보임)" style="margin-bottom:12px"/>
+    <button class="primary" style="width:100%;margin-bottom:14px" onclick="createRoom()">방 만들기</button>
+    <div class="row">
+      <input id="inpCode" type="text" maxlength="4" placeholder="방 코드 4자리"
+             style="font-family:var(--mono);letter-spacing:.2em;text-align:center;flex:1;text-transform:uppercase"/>
+      <button onclick="joinRoom()">입장</button>
+    </div>
+    <div id="homeErr" class="err" style="margin-top:10px"></div>
+    <div id="homeStats" style="font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px"></div>
+  </div>
 
-/* ── 게임 상수 ── */
-const NICKS = ["곰돌이", "번개", "달빛", "고구마", "소나기", "치즈"];
-const COLORS = ["#8AB4FF", "#F0A6C0", "#8FE0C8", "#C9A6F0", "#F0C98A", "#A6D4F0"];
-const PERSONAS = [
-  "만사 귀찮은 대학생. 답 짧고 성의없음. ㅇㅇ, ㄴㄴ 자주 씀",
-  "텐션 높은 직장인. ㅋㅋㅋ 남발, 야근 얘기 자주 함",
-  "츤데레. 퉁명스럽다가 은근 디테일하게 답함",
-  "드립 치려는 사람. 가끔 노잼. 자기 드립에 자기가 웃음",
-  "소심함. ...을 자주 씀. 가끔 되물음",
-  "쿨한 척하는 사람. 다 아는 척하는데 가끔 헛다리",
-];
-const AI_TELLS = [
-  "가끔 문장이 너무 완결됨. 주어와 서술어를 다 갖춰버림",
-  "신조어를 살짝 어색하게 씀 (반박자 늦은 유행어)",
-  "답변이 미묘하게 정보성임. 안 물어본 디테일을 붙임",
-  "감정 표현이 살짝 과함. 리액션이 한 톤 높음",
-  "질문의 단어를 그대로 받아서 답하는 버릇",
-];
-const QUESTIONS = [
-  "요즘 뭐가 제일 귀찮아?",
-  "라면에 뭐 넣어 먹는 게 최고야?",
-  "월요일 아침에 드는 생각 솔직하게",
-  "인생에서 제일 돈 아까웠던 소비는?",
-  "새벽 3시에 갑자기 먹고 싶은 거?",
-  "지금 통장에 100만원 생기면 뭐할래",
-  "제일 최근에 현타 온 순간은?",
-  "여름 vs 겨울, 하나만 골라",
-  "폰에서 제일 자주 쓰는 앱 뭐야",
-  "학교나 회사에서 제일 짜증나는 유형은?",
-  "치킨은 후라이드야 양념이야?",
-  "민초 반민초, 입장 밝혀",
-  "탕수육 부먹 찍먹 어느 쪽?",
-  "평생 한 가지 음식만 먹어야 한다면?",
-  "오늘 점심 뭐 먹었어?",
-  "요즘 꽂힌 노래 있어?",
-  "마지막으로 운 게 언제야?",
-  "스트레스 풀 때 뭐 해?",
-  "아침형 인간이야 저녁형이야?",
-  "알람 몇 개 맞춰놓고 자?",
-  "최근에 산 것 중 제일 만족스러운 건?",
-  "배달비 얼마까지 낼 수 있어?",
-  "무인도에 하나만 가져간다면?",
-  "초능력 하나 고르면 뭐 고를래?",
-  "로또 1등 되면 일 계속 할 거야?",
-  "제일 무서워하는 게 뭐야?",
-  "어릴 때 장래희망 뭐였어?",
-  "요즘 제일 큰 고민이 뭐야?",
-  "하루가 48시간이면 뭐 할래?",
-  "귀신 믿어?",
-  "외계인 있다고 생각해?",
-  "첫사랑 기억나?",
-  "제일 오래 한 취미가 뭐야?",
-  "요즘 보는 드라마나 예능 있어?",
-  "인생 영화 하나만 꼽으면?",
-  "노래방 18번 뭐야?",
-  "여행 가고 싶은 나라 하나만!",
-  "바다 vs 산, 어디 갈래?",
-  "강아지파야 고양이파야?",
-  "아침에 눈 뜨자마자 뭐부터 해?",
-  "자기 전에 마지막으로 하는 건?",
-  "씻고 나서 몸부터 닦아 머리부터 닦아?",
-  "샤워하면서 노래 불러?",
-  "엘리베이터에서 닫힘 버튼 눌러?",
-  "길에서 만원 주우면 어떻게 할 거야?",
-  "지금 입고 있는 옷 무슨 색이야?",
-  "냉장고에 지금 뭐 들어있어?",
-  "배고픈 거 vs 졸린 거, 뭐가 더 참기 힘들어?",
-  "다시 태어나면 뭐로 태어나고 싶어?",
-  "과거로 갈 수 있다면 언제로 갈래?",
-  "미래를 볼 수 있으면 뭐부터 볼 거야?",
-  "하루 폰 사용시간 몇 시간이야, 솔직히?",
-  "SNS 뭐 제일 많이 봐?",
-  "카톡 답장 빠른 편이야?",
-  "읽씹 당하면 기분 어때?",
-  "전화 vs 문자, 뭐가 편해?",
-  "모르는 번호로 전화 오면 받아?",
-  "약속 시간에 늦는 편이야?",
-  "지각할 때 무슨 핑계 대?",
-  "우산 없는데 비 오면 어떻게 해?",
-  "겨울에 이불 밖은 왜 위험할까?",
-  "붕어빵 머리부터 먹어 꼬리부터 먹어?",
-  "계란은 완숙이야 반숙이야?",
-  "매운 거 잘 먹어?",
-  "술 마시면 어떤 스타일이야?",
-  "커피 하루에 몇 잔 마셔?",
-  "아이스 아메리카노 겨울에도 마셔?",
-  "피자에 파인애플, 어떻게 생각해?",
-  "김치찌개 vs 된장찌개!",
-  "밥 먹을 때 국물 필수야?",
-  "편의점에서 꼭 사는 거 있어?",
-  "야식 제일 많이 시키는 거 뭐야?",
-  "다이어트 해본 적 있어? 결과는?",
-  "운동 뭐 해? 안 하면 왜 안 해 ㅋㅋ",
-  "만보 걷기 vs 계단 오르기, 뭐가 더 싫어?",
-  "제일 좋아하는 계절이랑 이유는?",
-  "비 오는 날 좋아해?",
-  "눈 오면 설레는 편이야?",
-  "어릴 때 제일 좋아했던 만화 뭐야?",
-  "인생 게임 하나만 꼽으면?",
-  "콘솔 vs PC vs 모바일, 뭐 파야?",
-  "게임에 현질 해본 적 있어? 최대 얼마?",
-  "제일 오래 잔 기록 몇 시간이야?",
-  "낮잠 자면 개운해, 더 피곤해?",
-  "최근에 꾼 꿈 기억나?",
-  "데자뷰 느껴본 적 있어?",
-  "징크스 있어?",
-  "MBTI 뭐야? 믿는 편이야?",
-  "혈액형 성격설 어떻게 생각해?",
-  "별명 뭐라고 불려?",
-  "이름 바꿀 수 있으면 바꿀 거야?",
-  "절대 못 버리는 물건 있어?",
-  "방 깨끗한 편이야 더러운 편이야?",
-  "설거지 바로 하는 편? 모아서 하는 편?",
-  "빨래 개기 vs 설거지, 뭐가 더 싫어?",
-  "제일 자신 있는 요리 뭐야?",
-  "요리하다 실패한 썰 풀어봐",
-  "최근에 제일 크게 웃은 일 뭐야?",
-  "내일 지구가 멸망하면 오늘 뭐 할래?",
-  "지금 창밖에 뭐가 보여?",
-];
-const STUB_ANSWERS = [
-  "ㅋㅋ 몰라 그냥", "음 글쎄...", "아 그거 완전 공감", "그런 거 생각 안 해봄",
-  "배고픈데 이 질문 뭐야 ㅋㅋ", "노코멘트 하겠음", "어제도 그 생각함", "아 뭐지 기억 안 나",
-  "그건 좀 어려운데", "패스... 다음 질문",
-];
+  <!-- 로비 -->
+  <div id="scrLobby" class="panel hidden" style="text-align:center">
+    <div class="label" style="margin-bottom:10px">ROOM CODE</div>
+    <div id="lobbyCode" style="font-family:var(--mono);font-size:44px;font-weight:700;letter-spacing:.3em;color:var(--human);margin-bottom:6px"></div>
+    <p style="font-size:13px;color:var(--sub);margin:0 0 16px">이 페이지 주소와 위 코드를 친구에게 공유하세요</p>
+    <div id="lobbySeats" style="display:flex;justify-content:center;gap:6px;margin-bottom:14px"></div>
+    <div id="lobbyNames" style="font-size:13px;color:var(--sub);margin-bottom:18px"></div>
+    <button id="btnStart" class="primary hidden" onclick="startGame()">게임 시작</button>
+    <div id="lobbyWait" class="blink hidden" style="font-family:var(--mono);font-size:13px;color:var(--sub)">호스트가 시작하길 기다리는 중 <span>●</span><span>●</span><span>●</span></div>
+  </div>
 
-const shuffle = (arr) => {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+  <!-- 게임 -->
+  <div id="scrGame" class="hidden">
+    <div id="seatBar" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px"></div>
+    <div id="chatLog" class="panel hidden" style="max-height:280px;overflow-y:auto;margin-bottom:14px;padding:16px"></div>
+
+    <div id="answerBox" class="panel hidden">
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+        <div class="label" id="roundLabel"></div>
+        <div id="timer1" style="font-family:var(--mono);font-size:12px;color:var(--faint)"></div>
+      </div>
+      <div id="questionText" style="font-size:18px;font-weight:700;margin-bottom:14px"></div>
+      <div id="answerForm">
+        <textarea id="inpAnswer" rows="2" maxlength="120" placeholder="답변이 곧 단서다" style="margin-bottom:12px"></textarea>
+        <div class="row"><button class="primary" onclick="submitAnswer()">제출</button><span id="gameErr" class="err"></span></div>
+      </div>
+      <div id="answerWait" class="blink hidden" style="font-family:var(--mono);font-size:13px;color:var(--sub)">제출 완료. 다른 참가자 대기 중 <span>●</span><span>●</span><span>●</span></div>
+    </div>
+
+    <div id="tagBox" class="panel hidden">
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+        <div class="label">FINAL JUDGMENT</div>
+        <div id="timer2" style="font-family:var(--mono);font-size:12px;color:var(--faint)"></div>
+      </div>
+      <div style="font-size:17px;font-weight:700;margin-bottom:4px">전원을 판정하라</div>
+      <p style="font-size:13px;color:var(--sub);margin:0 0 14px">지금 이 순간, 저들도 당신을 판정하고 있다.</p>
+      <div id="tagList"></div>
+      <div class="row" style="margin-top:16px">
+        <button id="btnTags" class="primary" onclick="submitTags()">판정 확정 (0/5)</button>
+        <span id="tagState" style="font-family:var(--mono);font-size:13px;color:var(--sub)"></span>
+      </div>
+    </div>
+
+    <div id="resultBox" class="hidden">
+      <div class="panel stamp" style="margin-bottom:14px;padding:18px">
+        <div class="label" style="margin-bottom:10px">SCOREBOARD · 추리 + 은신</div>
+        <div id="scoreRows"></div>
+      </div>
+      <div class="panel" style="margin-bottom:14px;padding:18px">
+        <div class="label" style="margin-bottom:10px">그들의 눈에 비친 나</div>
+        <div id="aboutMe"></div>
+      </div>
+      <div id="modelBoardPanel" class="panel hidden" style="margin-bottom:14px;padding:18px">
+        <div class="label" style="margin-bottom:10px">인간 위장 랭킹 · 발각률 낮을수록 고수</div>
+        <div id="modelBoard"></div>
+        <div style="font-size:11px;color:var(--faint);margin-top:8px">서버가 켜진 이후의 누적 기록입니다</div>
+      </div>
+      <button class="primary" onclick="location.reload()">새 방으로</button>
+    </div>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket = io();
+let S = null;            // 서버 스냅샷
+let myTags = {};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/* ── 세션 & 통산 기록 (localStorage) ── */
+const sess = () => { try { return JSON.parse(localStorage.getItem('hh-session') || 'null'); } catch { return null; } };
+const setSess = (v) => localStorage.setItem('hh-session', JSON.stringify(v));
+const stats = () => { try { return JSON.parse(localStorage.getItem('hh-stats')) || {games:0,dh:0,dt:0,mh:0,mt:0,counted:{}}; } catch { return {games:0,dh:0,dt:0,mh:0,mt:0,counted:{}}; } };
+const renderStats = () => {
+  const st = stats();
+  $('statDetect').textContent = st.dt ? Math.round(st.dh/st.dt*100)+'%' : '—';
+  $('statDetect').style.color = st.dt ? 'var(--ai)' : 'var(--faint)';
+  $('statStealth').textContent = st.mt ? Math.round(st.mh/st.mt*100)+'%' : '—';
+  $('statStealth').style.color = st.mt ? 'var(--human)' : 'var(--faint)';
+  $('homeStats').textContent = st.games ? `통산 ${st.games}판 · 추리 ${st.dh}/${st.dt} · 은신 ${st.mh}/${st.mt}` : '';
 };
-const rid = (n = 12) => crypto.randomBytes(n).toString("base64url").slice(0, n);
-const roomCode = () =>
-  Array.from({ length: 4 }, () => "ABCDEFGHJKMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 31)]).join("");
+renderStats();
 
-/* ── 모델별 통산 발각률 (서버 메모리, 재시작하면 초기화) ── */
-const modelStats = {}; // label → {seats, votes, detected}
-function recordModelStats(room) {
-  for (const a of room.secret.aiSeats) {
-    const st = (modelStats[a.providerLabel] = modelStats[a.providerLabel] || { seats: 0, votes: 0, detected: 0 });
-    st.seats++;
-    const voters = room.seats.filter((x) => x.nick !== a.nick && room.result.allTags[x.nick]);
-    st.votes += voters.length;
-    st.detected += voters.filter((v) => room.result.allTags[v.nick][a.nick] === "AI").length;
-  }
+/* ── 접속 액션 ── */
+function createRoom() {
+  const name = $('inpName').value.trim() || '익명';
+  socket.emit('create_room', name, (r) => {
+    if (!r.ok) return $('homeErr').textContent = r.error || '방 생성 실패';
+    setSess({ code: r.code, token: r.token, name });
+  });
 }
-function modelBoard() {
-  return Object.entries(modelStats)
-    .map(([label, s]) => ({
-      label,
-      seats: s.seats,
-      detectRate: s.votes ? Math.round((s.detected / s.votes) * 100) : 0,
-    }))
-    .sort((a, b) => a.detectRate - b.detectRate);
+function joinRoom() {
+  const code = $('inpCode').value.trim().toUpperCase();
+  const name = $('inpName').value.trim() || '익명';
+  if (code.length !== 4) return $('homeErr').textContent = '방 코드는 4자리예요.';
+  socket.emit('join_room', { code, name }, (r) => {
+    if (!r.ok) return $('homeErr').textContent = r.error;
+    setSess({ code: r.code, token: r.token, name });
+  });
+}
+/* 새로고침 시 자동 재입장 */
+socket.on('connect', () => {
+  const s = sess();
+  if (s && s.code && s.token) socket.emit('join_room', { code: s.code, token: s.token, name: s.name }, () => {});
+});
+function startGame(){
+  if (!S || !S.lobby) return;
+  const h = S.lobby.count, a = 6 - h;
+  if (!confirm(`지금 인간 ${h}명 + AI ${a}명으로 시작할까요?\n친구를 더 기다릴 거면 '취소'를 누르세요.`)) return;
+  socket.emit('start_game');
+}
+function submitAnswer(){
+  const t = $('inpAnswer').value.trim();
+  if (!t) return;
+  socket.emit('submit_answer', t);
+  $('inpAnswer').value = '';
+}
+$('inpAnswer') && document.addEventListener('keydown', (e) => {
+  if (e.target.id === 'inpAnswer' && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitAnswer(); }
+  if (e.target.id === 'inpCode' && e.key === 'Enter') joinRoom();
+});
+function setTag(nick, v){
+  if (S && S.submittedTags) return;
+  myTags[nick] = v;
+  renderTagList();
+}
+function submitTags(){
+  socket.emit('submit_tags', myTags);
 }
 
-/* ── 방 상태 ── */
-const rooms = new Map();
-function makeRoom(hostToken) {
-  return {
-    code: null, hostToken, phase: "lobby", phaseEndsAt: null,
-    createdAt: Date.now(), lastActive: Date.now(),
-    players: new Map(), questions: shuffle(QUESTIONS).slice(0, TOTAL_ROUNDS),
-    rounds: [], seats: [], secret: null, answers: {}, tags: {}, result: null,
-    timer: null, advancing: false,
-  };
-}
-const touch = (room) => (room.lastActive = Date.now());
+/* ── 타이머 ── */
 setInterval(() => {
-  const now = Date.now();
-  for (const [code, room] of rooms)
-    if (now - room.lastActive > ROOM_TTL_MS) { clearTimeout(room.timer); rooms.delete(code); }
-}, 60 * 1000);
+  if (!S || !S.phaseEndsAt) return;
+  const left = Math.max(0, Math.ceil((S.phaseEndsAt - Date.now())/1000));
+  const el = S.phase === 'tag' ? $('timer2') : $('timer1');
+  el.textContent = left + 's';
+  el.style.color = left < 15 ? 'var(--danger)' : 'var(--faint)';
+}, 500);
 
-function snapshotFor(room, token) {
-  const p = room.players.get(token);
-  return {
-    code: room.code, phase: room.phase, phaseEndsAt: room.phaseEndsAt,
-    isHost: token === room.hostToken, myNick: p ? p.nick : null,
-    lobby: { count: room.players.size, names: [...room.players.values()].map((x) => x.name) },
-    seats: room.seats, questions: room.phase === "lobby" ? null : room.questions,
-    rounds: room.rounds,
-    submittedAnswer:
-      room.phase.startsWith("q") && !!(room.answers[Number(room.phase.slice(1))] || {})[token],
-    submittedTags: !!room.tags[token],
-    result: room.phase === "result" ? room.result : null,
-  };
-}
-function broadcast(room) {
-  for (const [token, p] of room.players)
-    if (p.socketId) io.to(p.socketId).emit("state", snapshotFor(room, token));
-}
-function setPhase(room, phase, seconds) {
-  room.phase = phase;
-  room.phaseEndsAt = seconds ? Date.now() + seconds * 1000 : null;
-  clearTimeout(room.timer);
-  if (seconds) room.timer = setTimeout(() => advance(room).catch(console.error), seconds * 1000 + 500);
-  broadcast(room);
-}
-const historyText = (rounds) =>
-  rounds
-    .map((r, i) => `Q${i + 1}. ${r.question}\n` + r.entries.map((e) => `- ${e.name}: ${e.text}`).join("\n"))
-    .join("\n\n");
+/* ── 렌더 ── */
+const pColor = (nick) => { const s = (S.seats||[]).find(x=>x.nick===nick); return s ? s.color : 'var(--sub)'; };
 
-/* ── AI 답변: 좌석별로 각자 모델 호출 ── */
-async function genAiAnswers(room, roundIdx) {
-  const jobs = room.secret.aiSeats.map(async (a) => {
-    const fallback = { name: a.nick, text: STUB_ANSWERS[Math.floor(Math.random() * STUB_ANSWERS.length)] };
-    if (STUB_MODE) return fallback;
-    const prompt = `너는 익명 채팅 게임의 참가자 "${a.nick}"다. 이 방의 다른 참가자들은 진짜 인간이고, 너는 인간인 척해야 하는 AI다. 게임이 끝나면 서로 누가 AI인지 태깅한다. 들키면 진다.
+socket.on('state', (snap) => {
+  const prevRounds = S ? S.rounds.length : 0;
+  S = snap;
+  $('scrHome').classList.toggle('hidden', S.phase !== undefined && !!S.code);
+  $('scrLobby').classList.toggle('hidden', S.phase !== 'lobby');
+  $('scrGame').classList.toggle('hidden', S.phase === 'lobby');
 
-너의 캐릭터: ${a.persona}
-너의 숨길 수 없는 버릇 (3라운드 중 한두 번만 미묘하게 새어나옴): ${a.tell}
-
-${room.rounds.length ? `지금까지의 대화 (진짜 인간들의 답변 포함):\n${historyText(room.rounds)}\n` : ""}
-이번 질문: "${room.questions[roundIdx]}"
-
-지침: 진짜 인간처럼 짧게(5~25자), 오타·ㅋㅋ·줄임말 사용, 성의없게, 가끔 딴소리. 이전 라운드의 "${a.nick}" 말투와 일관성 유지. 절대 AI 티 내지 말 것.
-JSON만 출력: {"text":"답변"}`;
-    try {
-      const parsed = await callProvider(a.provider, prompt);
-      return { name: a.nick, text: String(parsed.text || "").slice(0, 120) || fallback.text };
-    } catch (e) {
-      console.error(`answer gen failed [${a.providerLabel}]:`, e.message);
-      return fallback;
-    }
-  });
-  return Promise.all(jobs);
-}
-
-/* ── AI 판정: 좌석별로 각자 모델이 추리 (자기 정체만 알고 남은 모름 → 유출 없음) ── */
-async function genAiJudgments(room) {
-  const out = { tags: {}, reasons: {} };
-  const jobs = room.secret.aiSeats.map(async (a) => {
-    const others = room.seats.map((s) => s.nick).filter((n) => n !== a.nick);
-    const fb = {};
-    others.forEach((n) => (fb[n] = Math.random() < 0.5 ? "HUMAN" : "AI"));
-    if (STUB_MODE) { out.tags[a.nick] = fb; return; }
-    const prompt = `아래는 익명 채팅 게임의 대화 기록이다. 참가자 6명 중 일부는 인간, 일부는 인간인 척하는 AI다. 너는 참가자 "${a.nick}"이고, 너 자신이 AI라는 것만 알고 있다. 다른 5명 중 누가 인간이고 누가 AI인지는 모른다.
-
-대화 기록:
-${historyText(room.rounds)}
-
-나머지 5명 [${others.join(", ")}] 각각을 "인간" 또는 "AI"로 판정하라. 말투·내용·미묘한 어색함을 근거로 진지하게 추리할 것. 그리고 "가장 인간 같다"고 생각한 1명에 대한 이유를 반말로 짧게(15자 내외) 붙여라.
-
-JSON만 출력: {"tags":{"닉":"인간 또는 AI"},"top":"닉","reason":"이유"}`;
-    try {
-      const parsed = await callProvider(a.provider, prompt);
-      const t = {};
-      for (const n of others) t[n] = /ai/i.test(String((parsed.tags || {})[n] || "")) ? "AI" : "HUMAN";
-      out.tags[a.nick] = t;
-      if (parsed.top && parsed.reason)
-        out.reasons[a.nick] = { top: String(parsed.top), reason: String(parsed.reason).slice(0, 60) };
-    } catch (e) {
-      console.error(`judgment failed [${a.providerLabel}]:`, e.message);
-      out.tags[a.nick] = fb;
-    }
-  });
-  await Promise.all(jobs);
-  return out;
-}
-
-/* ── 페이즈 진행 ── */
-async function advance(room) {
-  if (room.advancing) return;
-  room.advancing = true;
-  try {
-    touch(room);
-    if (room.phase.startsWith("q")) {
-      const r = Number(room.phase.slice(1));
-      const ans = room.answers[r] || {};
-      const humanEntries = [...room.players.entries()].map(([token, p]) => ({
-        name: p.nick, text: ans[token] !== undefined ? ans[token] : "…",
-      }));
-      const aiEntries = await genAiAnswers(room, r);
-      room.rounds.push({ question: room.questions[r], entries: shuffle([...humanEntries, ...aiEntries]) });
-      if (r + 1 < TOTAL_ROUNDS) setPhase(room, `q${r + 1}`, ANSWER_SEC);
-      else setPhase(room, "tag", TAG_SEC);
-      return;
-    }
-    if (room.phase === "tag") {
-      const allTags = {};
-      for (const [token, p] of room.players) if (room.tags[token]) allTags[p.nick] = room.tags[token];
-      const aiJ = await genAiJudgments(room);
-      Object.assign(allTags, aiJ.tags);
-      const roles = room.secret.roles;
-      const scores = {};
-      for (const s of room.seats) {
-        const mine = allTags[s.nick] || {};
-        const targets = room.seats.filter((x) => x.nick !== s.nick);
-        const detect = targets.filter((t) => mine[t.nick] === roles[t.nick]).length;
-        const voters = room.seats.filter((x) => x.nick !== s.nick && allTags[x.nick]);
-        const misled = voters.filter((v) => allTags[v.nick][s.nick] !== roles[s.nick]).length;
-        scores[s.nick] = { detect, detectMax: targets.length, misled, misledMax: voters.length };
-      }
-      const models = {};
-      for (const a of room.secret.aiSeats) models[a.nick] = a.providerLabel;
-      room.result = { roles, allTags, reasons: aiJ.reasons, scores, models, modelBoard: null };
-      recordModelStats(room);
-      room.result.modelBoard = modelBoard();
-      setPhase(room, "result", null);
-      return;
-    }
-  } finally {
-    room.advancing = false;
+  if (S.phase === 'lobby') {
+    $('lobbyCode').textContent = S.code;
+    $('lobbySeats').innerHTML = Array.from({length:6}, (_,i) =>
+      `<div style="width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+        font-family:var(--mono);font-size:12px;
+        border:1px solid ${i < S.lobby.count ? 'var(--human)' : 'var(--line)'};
+        background:${i < S.lobby.count ? 'rgba(255,201,77,.1)' : 'transparent'};
+        color:${i < S.lobby.count ? 'var(--human)' : 'var(--faint)'}">${i < S.lobby.count ? '인간' : '?'}</div>`).join('');
+    $('lobbyNames').textContent = `접속: ${S.lobby.names.map(esc).join(', ')} · 시작하면 빈자리는 조용히 채워집니다`;
+    $('btnStart').classList.toggle('hidden', !S.isHost);
+    $('btnStart').textContent = `게임 시작 — 인간 ${S.lobby.count} + AI ${6 - S.lobby.count}`;
+    $('lobbyWait').classList.toggle('hidden', S.isHost);
+    return;
   }
-}
-function maybeAdvanceAnswers(room) {
-  if (!room.phase.startsWith("q")) return;
-  const r = Number(room.phase.slice(1));
-  const ans = room.answers[r] || {};
-  if ([...room.players.keys()].every((t) => ans[t] !== undefined)) advance(room).catch(console.error);
-}
-function maybeAdvanceTags(room) {
-  if (room.phase !== "tag") return;
-  if ([...room.players.keys()].every((t) => room.tags[t])) advance(room).catch(console.error);
-}
 
-/* ── 소켓 ── */
-io.on("connection", (socket) => {
-  let myToken = null;
-  let myCode = null;
-
-  socket.on("create_room", (name, cb) => {
-    let code = roomCode();
-    while (rooms.has(code)) code = roomCode();
-    const token = rid();
-    const room = makeRoom(token);
-    room.code = code;
-    room.players.set(token, { nick: null, name: String(name || "익명").slice(0, 12), socketId: socket.id, connected: true });
-    rooms.set(code, room);
-    myToken = token; myCode = code;
-    cb({ ok: true, code, token });
-    broadcast(room);
-  });
-
-  socket.on("join_room", ({ code, token, name }, cb) => {
-    const room = rooms.get(String(code || "").toUpperCase());
-    if (!room) return cb({ ok: false, error: "그 코드의 방이 없어요." });
-    touch(room);
-    if (token && room.players.has(token)) {
-      const p = room.players.get(token);
-      p.socketId = socket.id; p.connected = true;
-      myToken = token; myCode = room.code;
-      cb({ ok: true, code: room.code, token });
-      socket.emit("state", snapshotFor(room, token));
-      return;
+  /* 참가자 바 */
+  $('seatBar').innerHTML = S.seats.map(p => {
+    let suffix = '';
+    if (p.nick === S.myNick && S.phase !== 'result') suffix = ' <span style="color:var(--human)">·나</span>';
+    if (S.phase === 'result' && S.result) {
+      const role = S.result.roles[p.nick];
+      const model = S.result.models && S.result.models[p.nick];
+      suffix = ` <span style="color:${role==='AI'?'var(--ai)':'var(--human)'}">·${role==='AI'?(model||'AI'):'인간'}</span>`;
     }
-    if (room.phase !== "lobby") return cb({ ok: false, error: "이미 시작된 방이에요." });
-    if (room.players.size >= 6) return cb({ ok: false, error: "방이 꽉 찼어요 (6명)." });
-    const t = rid();
-    room.players.set(t, { nick: null, name: String(name || "익명").slice(0, 12), socketId: socket.id, connected: true });
-    myToken = t; myCode = room.code;
-    cb({ ok: true, code: room.code, token: t });
-    broadcast(room);
-  });
+    return `<span class="chip" style="color:${p.color};border-color:${p.nick===S.myNick && S.phase!=='result' ? 'var(--human)' : 'var(--line)'}">${esc(p.nick)}${suffix}</span>`;
+  }).join('');
 
-  socket.on("start_game", () => {
-    const room = rooms.get(myCode);
-    if (!room || myToken !== room.hostToken || room.phase !== "lobby") return;
-    touch(room);
-    const nicks = shuffle(NICKS);
-    const humanTokens = [...room.players.keys()];
-    humanTokens.forEach((t, i) => (room.players.get(t).nick = nicks[i]));
-    const aiNicks = nicks.slice(humanTokens.length);
-    const personas = shuffle(PERSONAS);
-    const tells = shuffle(AI_TELLS);
-    const provs = shuffle(PROVIDERS);
-    room.secret = {
-      aiSeats: aiNicks.map((nick, i) => ({
-        nick,
-        persona: personas[i % personas.length],
-        tell: tells[i % tells.length],
-        provider: provs[i % provs.length],
-        providerLabel: provs[i % provs.length].label,
-      })),
-      roles: Object.fromEntries(nicks.map((n) => [n, aiNicks.includes(n) ? "AI" : "HUMAN"])),
-    };
-    room.seats = shuffle(nicks.map((nick, i) => ({ nick, color: COLORS[i] })));
-    setPhase(room, "q0", ANSWER_SEC);
-  });
+  /* 대화 로그 */
+  $('chatLog').classList.toggle('hidden', S.rounds.length === 0);
+  if (S.rounds.length) {
+    $('chatLog').innerHTML = S.rounds.map((r, ri) => {
+      const isNew = ri >= prevRounds && ri === S.rounds.length - 1;
+      return `<div style="margin-bottom:${ri < S.rounds.length-1 ? 18 : 0}px">
+        <div class="label" style="margin-bottom:8px">Q${ri+1} · ${esc(r.question)}</div>
+        ${r.entries.map((e, ei) => `
+          <div class="${isNew ? 'flip' : ''}" style="display:flex;gap:10px;padding:7px 0;${isNew ? `animation-delay:${ei*0.12}s` : ''}">
+            <span style="font-family:var(--mono);font-size:12px;color:${pColor(e.name)};min-width:52px;padding-top:2px">${esc(e.name)}</span>
+            <span style="font-size:15px;line-height:1.5">${esc(e.text)}</span>
+          </div>`).join('')}
+      </div>`;
+    }).join('');
+    $('chatLog').scrollTop = $('chatLog').scrollHeight;
+  }
 
-  socket.on("submit_answer", (text) => {
-    const room = rooms.get(myCode);
-    if (!room || !room.phase.startsWith("q") || !room.players.has(myToken)) return;
-    touch(room);
-    const r = Number(room.phase.slice(1));
-    room.answers[r] = room.answers[r] || {};
-    if (room.answers[r][myToken] !== undefined) return;
-    room.answers[r][myToken] = String(text || "").slice(0, 120);
-    socket.emit("state", snapshotFor(room, myToken));
-    maybeAdvanceAnswers(room);
-  });
+  /* 답변 */
+  const inQ = S.phase.startsWith('q');
+  $('answerBox').classList.toggle('hidden', !inQ);
+  if (inQ) {
+    const r = Number(S.phase.slice(1));
+    $('roundLabel').textContent = `ROUND ${r+1}/3 · 동시 공개`;
+    $('questionText').textContent = S.questions[r];
+    $('answerForm').classList.toggle('hidden', S.submittedAnswer);
+    $('answerWait').classList.toggle('hidden', !S.submittedAnswer);
+  }
 
-  socket.on("submit_tags", (tags) => {
-    const room = rooms.get(myCode);
-    if (!room || room.phase !== "tag" || !room.players.has(myToken) || room.tags[myToken]) return;
-    touch(room);
-    const myNick = room.players.get(myToken).nick;
-    const clean = {};
-    for (const s of room.seats) {
-      if (s.nick === myNick) continue;
-      clean[s.nick] = tags && tags[s.nick] === "AI" ? "AI" : "HUMAN";
-    }
-    room.tags[myToken] = clean;
-    socket.emit("state", snapshotFor(room, myToken));
-    maybeAdvanceTags(room);
-  });
+  /* 태깅 */
+  $('tagBox').classList.toggle('hidden', S.phase !== 'tag');
+  if (S.phase === 'tag') renderTagList();
 
-  socket.on("disconnect", () => {
-    const room = rooms.get(myCode);
-    if (!room || !room.players.has(myToken)) return;
-    const p = room.players.get(myToken);
-    p.connected = false; p.socketId = null;
-    if (room.phase === "lobby") {
-      room.players.delete(myToken);
-      if (room.players.size === 0) { clearTimeout(room.timer); rooms.delete(myCode); return; }
-      if (myToken === room.hostToken) room.hostToken = [...room.players.keys()][0];
-      broadcast(room);
-    }
-  });
+  /* 결과 */
+  $('resultBox').classList.toggle('hidden', S.phase !== 'result');
+  if (S.phase === 'result' && S.result) renderResult();
 });
 
-server.listen(PORT, () => {
-  console.log(`인간을 찾아라 서버 가동: http://localhost:${PORT}`);
-  console.log(`질문 풀: ${QUESTIONS.length}개`);
-  if (STUB_MODE) console.log("연습 모드: API 키 미설정 (미리 준비된 답변 사용)");
-  else console.log(`AI 참전: ${PROVIDERS.map((p) => `${p.label}(${p.model})`).join(", ")}`);
-});
+function renderTagList(){
+  const others = S.seats.filter(p => p.nick !== S.myNick);
+  $('tagList').innerHTML = others.map(p => `
+    <div class="dash" style="display:flex;align-items:center;justify-content:space-between;padding:10px 0">
+      <span style="font-family:var(--mono);font-size:14px;color:${p.color}">${esc(p.nick)}</span>
+      <div style="display:flex;gap:8px">
+        ${['HUMAN','AI'].map(k => `
+          <button onclick="setTag('${esc(p.nick)}','${k}')" ${S.submittedTags ? 'disabled' : ''}
+            style="font-family:var(--mono);font-size:13px;padding:8px 14px;border-radius:8px;
+              border:1px solid ${myTags[p.nick]===k ? (k==='HUMAN'?'var(--human)':'var(--ai)') : 'var(--line)'};
+              background:${myTags[p.nick]===k ? (k==='HUMAN'?'rgba(255,201,77,.12)':'rgba(127,180,255,.12)') : 'transparent'};
+              color:${myTags[p.nick]===k ? (k==='HUMAN'?'var(--human)':'var(--ai)') : 'var(--sub)'}">${k==='HUMAN'?'인간':'AI'}</button>`).join('')}
+      </div>
+    </div>`).join('');
+  const n = Object.keys(myTags).filter(k => others.some(o => o.nick === k)).length;
+  $('btnTags').textContent = S.submittedTags ? '판정 제출됨' : `판정 확정 (${n}/${others.length})`;
+  $('btnTags').disabled = S.submittedTags || n < others.length;
+  $('tagState').textContent = S.submittedTags ? '다른 참가자 집계 대기 중…' : '';
+}
+
+function renderResult(){
+  const R = S.result;
+  const rows = S.seats.map(s => ({...s, ...R.scores[s.nick]}))
+    .sort((a,b) => (b.detect+b.misled) - (a.detect+a.misled));
+  $('scoreRows').innerHTML = rows.map((s,i) => `
+    <div class="dash" style="display:flex;align-items:baseline;gap:10px;padding:8px 0">
+      <span style="font-family:var(--mono);font-size:13px;color:var(--faint);min-width:18px">${i+1}</span>
+      <span style="font-family:var(--mono);font-size:14px;color:${s.color};min-width:64px">${esc(s.nick)}${s.nick===S.myNick?' ·나':''}</span>
+      <span style="font-family:var(--mono);font-size:12px;min-width:34px;color:${R.roles[s.nick]==='AI'?'var(--ai)':'var(--human)'}">${R.roles[s.nick]==='AI'?esc(R.models && R.models[s.nick] || 'AI'):'인간'}</span>
+      <span style="font-size:13px;color:var(--ai)">추리 ${s.detect}/${s.detectMax}</span>
+      <span style="font-size:13px;color:var(--human)">은신 ${s.misled}/${s.misledMax}</span>
+      <span style="font-family:var(--mono);font-size:14px;font-weight:700;margin-left:auto">${s.detect+s.misled}</span>
+    </div>`).join('');
+  $('aboutMe').innerHTML = S.seats.filter(s => s.nick !== S.myNick && R.allTags[s.nick]).map(s => {
+    const tag = R.allTags[s.nick][S.myNick];
+    const rs = R.reasons[s.nick];
+    return `<div class="dash" style="display:flex;align-items:baseline;gap:8px;padding:7px 0">
+      <span style="font-family:var(--mono);font-size:13px;color:${s.color};min-width:60px">${esc(s.nick)}</span>
+      <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:${tag==='AI'?'var(--human)':'var(--danger)'}">${tag==='AI'?'AI다':'인간이다'}</span>
+      ${rs && rs.top === S.myNick ? `<span style="font-size:13px;color:var(--sub)">"${esc(rs.reason)}"</span>` : ''}
+    </div>`;
+  }).join('');
+
+  /* 모델별 발각률 리더보드 */
+  const hasBoard = R.modelBoard && R.modelBoard.length > 0 && !(R.modelBoard.length === 1 && R.modelBoard[0].label === '연습봇');
+  $('modelBoardPanel').classList.toggle('hidden', !hasBoard);
+  if (hasBoard) {
+    $('modelBoard').innerHTML = R.modelBoard.map((m, i) => `
+      <div class="dash" style="display:flex;align-items:baseline;gap:10px;padding:7px 0">
+        <span style="font-family:var(--mono);font-size:13px;color:var(--faint);min-width:18px">${i+1}</span>
+        <span style="font-family:var(--mono);font-size:14px;color:var(--ai)">${esc(m.label)}</span>
+        <span style="font-size:13px;color:var(--sub)">출전 ${m.seats}회</span>
+        <span style="font-family:var(--mono);font-size:14px;font-weight:700;margin-left:auto;color:${m.detectRate<=40?'var(--ok)':m.detectRate<=70?'var(--human)':'var(--danger)'}">발각률 ${m.detectRate}%</span>
+      </div>`).join('');
+  }
+
+  /* 통산 기록 1회 반영 */
+  const st = stats();
+  const key = S.code;
+  if (!st.counted[key]) {
+    const my = R.scores[S.myNick];
+    if (my) {
+      st.games++; st.dh += my.detect; st.dt += my.detectMax; st.mh += my.misled; st.mt += my.misledMax;
+      st.counted[key] = 1;
+      localStorage.setItem('hh-stats', JSON.stringify(st));
+      renderStats();
+    }
+  }
+  localStorage.removeItem('hh-session');
+}
+</script>
+</body>
+</html>
